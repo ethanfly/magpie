@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/tidwall/gjson"
 	"github.com/yetone/magpie/internal/provider"
 )
 
@@ -259,5 +260,53 @@ func TestDeepSeekToolPatternsPreservesCallerSpareCapacity(t *testing.T) {
 	}
 	if !bytes.Contains(out, []byte(`\\u0000`)) {
 		t.Fatalf("output does not contain normalized pattern: %s", out)
+	}
+}
+
+// artifact4852Tools is the tool schema #4852's error names: Claude Code's
+// Artifact tool, its file_paths items pattern "^[^\\0]*$", as a chat
+// request to a relay carries it.
+const artifact4852Tools = `"tools":[{"type":"function","function":{"name":"Artifact","parameters":{"type":"object","properties":{"file_paths":{"type":"array","items":{"type":"string","pattern":"^[^\\0]*$"}}}}}}]`
+
+func TestDeepSeekToolPatternsRelayedModel4852(t *testing.T) {
+	body := []byte(`{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi \\0"}],` + artifact4852Tools + `}`)
+	relay := provider.Provider{ID: "opendesign", Chat: "https://amr-link.open-design.ai/v1"}
+	out := deepseekToolPatterns(relay, provider.Chat, body)
+	if got := gjson.GetBytes(out, "tools.0.function.parameters.properties.file_paths.items.pattern").String(); got != `^[^\u0000]*$` {
+		t.Errorf("pattern = %q, want the null escape normalized", got)
+	}
+	// only the pattern changes: the message and the rest stay byte for byte
+	want := bytes.ReplaceAll(body, []byte(`"^[^\\0]*$"`), []byte(`"^[^\\u0000]*$"`))
+	if !bytes.Equal(out, want) {
+		t.Fatalf("body changed beyond its patterns:\n%s", out)
+	}
+	// a relay's or router's name for the model, prefix and case as they come
+	for _, model := range []string{"opendesign/deepseek-v4-pro", "x/deepseek-chat", "DeepSeek-R1"} {
+		b := bytes.Replace(body, []byte(`"deepseek-v4.1-flash"`), []byte(`"`+model+`"`), 1)
+		if bytes.Equal(deepseekToolPatterns(relay, provider.Chat, b), b) {
+			t.Errorf("%s: pattern not fixed", model)
+		}
+	}
+}
+
+func TestDeepSeekToolPatternsRelayOtherModelsAsTheyCame(t *testing.T) {
+	relay := provider.Provider{ID: "opendesign", Chat: "https://amr-link.open-design.ai/v1"}
+	for _, model := range []string{"kimi-k3", "claude-sonnet-5", "grok-4.7", "gpt-6-astra"} {
+		body := []byte(`{"model":"` + model + `",` + artifact4852Tools + `}`)
+		if out := deepseekToolPatterns(relay, provider.Chat, body); !bytes.Equal(out, body) {
+			t.Errorf("%s: body changed:\n%s", model, out)
+		}
+	}
+	// a non-deepseek provider naming no model goes as it came (#2317's
+	// shape: the relay serves someone else's model and the body says which)
+	body := []byte(`{` + artifact4852Tools + `}`)
+	p := provider.Provider{Preset: "anthropic", Chat: "https://api.anthropic.com/v1"}
+	if out := deepseekToolPatterns(p, provider.Chat, body); !bytes.Equal(out, body) {
+		t.Fatalf("no model named, non-deepseek provider: body changed:\n%s", out)
+	}
+	// a relayed DeepSeek request whose patterns need nothing passes through as it came
+	body = []byte(`{"model":"deepseek-v4.1-flash","tools":[{"name":"x","parameters":{"properties":{"u":{"pattern":"^https?://[a-z]+$"}}}}]}`)
+	if out := deepseekToolPatterns(relay, provider.Chat, body); !bytes.Equal(out, body) {
+		t.Fatalf("body with nothing to fix changed:\n%s", out)
 	}
 }

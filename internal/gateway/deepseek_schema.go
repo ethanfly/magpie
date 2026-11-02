@@ -15,18 +15,37 @@ import (
 // to the Unicode escape \u0000. DeepSeek's schema validator rejects \0 with:
 // "Invalid schema for function ... is not a 'regex'".
 //
+// It is DeepSeek's whoever serves it: the deepseek preset, api.deepseek.com,
+// or the model named in the body (deepseekModel), as the schema quirks travel
+// with the model and a relay runs its upstream's validator. Claude Code's
+// Artifact tool carries "^[^\\0]*$", so a relayed deepseek-v4.1-flash (Open
+// Design) was turned away on every turn (#4852). Every other model's tools
+// go as they came.
+//
 // To avoid re-encoding the entire payload or tool array (which reorders keys,
 // escapes <, > and &, and breaks prompt caching), it finds only the offending
 // "pattern" fields in tool schemas using gjson and splices the normalized string
 // literals in place from the end of the body backwards.
 func deepseekToolPatterns(p provider.Provider, to provider.Protocol, body []byte) []byte {
-	if p.Preset != "deepseek" && provider.HostOf(p.Base(to)) != "api.deepseek.com" {
+	if p.Preset != "deepseek" && provider.HostOf(p.Base(to)) != "api.deepseek.com" &&
+		!deepseekModel(gjson.GetBytes(body, "model").String()) {
 		return body
 	}
 	if !bytes.Contains(body, []byte(`\\0`)) {
 		return body
 	}
 	return toolPatterns(body, unicodeNullEscape)
+}
+
+// deepseekModel is whether id, the model as magpie or its upstream names it,
+// is one of DeepSeek's, under whatever vendor prefix a relay or router gives
+// it (opendesign/deepseek-v4-pro). It mirrors grokModel (grok_integral.go),
+// which gates grok_schema.go the same way.
+func deepseekModel(id string) bool {
+	if i := strings.LastIndexByte(id, '/'); i >= 0 {
+		id = id[i+1:]
+	}
+	return strings.HasPrefix(strings.ToLower(id), "deepseek")
 }
 
 // toolPatterns is body with fix applied to every "pattern" of its tools'
